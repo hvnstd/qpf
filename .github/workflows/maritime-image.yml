@@ -1,0 +1,111 @@
+# Build the Maritime image (repo-root Dockerfile) and push it to GHCR.
+#
+# Maritime pulls pre-built images only from PUBLIC registries, so after the
+# first push make sure the package is public:
+#   https://github.com/users/<owner>/packages  ->  qpf  ->  Settings
+#   ->  Change visibility -> Public
+#
+# Optional auto-deploy: set repository variable MARITIME_AGENT (the agent
+# name on Maritime) and secret MARITIME_TOKEN (mk_... API key); every
+# successful build then deploys the freshly pushed image and waits for it.
+name: Maritime Image (GHCR)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - deploy/maritime/**
+      - src/**
+      - plugins/hub/**
+      - packages/qwenpawmail-mcp/**
+      - website/public/docs/**
+      - pyproject.toml
+      - setup.py
+      - scripts/pack-tauri/stage_python_runtime.py
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The image bundles xfce4 + Chromium + a full Python ML stack; free the
+      # preinstalled toolchains we never use (~8 GB) to stay clear of the
+      # runner's disk limit.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc \
+            /usr/local/lib/android /usr/share/swift || true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Maritime micro-VMs are x86_64; amd64-only keeps the build fast and
+      # lets us --load the image for the smoke test before pushing.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Boot the image exactly like Maritime would (PORT injected) and wait
+      # for the adapter health endpoint; push only a verified image.
+      - name: Smoke test (boot + /health)
+        run: |
+          docker run -d --name qp -e PORT=8080 -p 8080:8080 \
+            "${IMAGE}:${GITHUB_SHA}"
+          ok=""
+          for i in $(seq 1 36); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+              localhost:8080/health || true)
+            if [ "$code" = "200" ]; then
+              echo "healthy after ~$((i * 10))s"
+              ok=1
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::container never became healthy; logs follow"
+            docker logs qp 2>&1 | tail -100
+            exit 1
+          fi
+          docker rm -f qp >/dev/null
+
+      - name: Push to GHCR
+        run: |
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${GITHUB_SHA}"
+
+      - name: Deploy to Maritime (optional)
+        if: ${{ vars.MARITIME_AGENT != '' }}
+        env:
+          MARITIME_TOKEN: ${{ secrets.MARITIME_TOKEN }}
+        run: |
+          npm install -g maritime-cli
+          maritime deploy "${{ vars.MARITIME_AGENT }}" \
+            --source docker \
+            --image "${IMAGE}:${GITHUB_SHA}" \
+            --wait --json
